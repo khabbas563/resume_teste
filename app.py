@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import time
 from typing import List, Optional
 
 import streamlit as st
@@ -24,7 +25,11 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 DEFAULT_MODEL = "gemini-3.8-flash"  # override with GEMINI_MODEL env var / secret
 # If the chosen model is retired (404), the app auto-discovers the newest available Flash model.
-EXCLUDED_MODEL_WORDS = ("lite", "image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics")
+EXCLUDED_MODEL_WORDS = ("image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics")
+MAX_RETRIES = 2  # wait-and-retry attempts per model for short rate limits / overload
+MAX_WAIT_SECONDS = 30  # never wait longer than this on one model; switch model instead
+MAX_MODELS_TRIED = 4
+_sleep = time.sleep
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000  # keeps the prompt comfortably inside the context window
 MIN_RESUME_CHARS = 150  # below this we assume extraction failed (e.g. scanned PDF)
@@ -187,10 +192,54 @@ def parse_analysis(raw: str) -> ResumeAnalysis:
     return analysis
 
 
-def _is_model_not_found(exc: Exception) -> bool:
+def _error_text(exc: Exception) -> str:
+    return str(exc)
+
+
+def _status_code(exc: Exception) -> Optional[int]:
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    text = str(exc)
-    return code == 404 or "NOT_FOUND" in text or "no longer available" in text
+    return code if isinstance(code, int) else None
+
+
+def _is_model_not_found(exc: Exception) -> bool:
+    text = _error_text(exc)
+    return _status_code(exc) == 404 or "NOT_FOUND" in text or "no longer available" in text
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    text = _error_text(exc)
+    return _status_code(exc) == 429 or "RESOURCE_EXHAUSTED" in text or "quota" in text.lower()
+
+
+def _is_hard_quota(exc: Exception) -> bool:
+    """Quota that will not recover within seconds (daily limit, or a limit of 0 on this model)."""
+    low = _error_text(exc).lower()
+    return "limit: 0" in low or "perday" in low or "per day" in low or "daily" in low
+
+
+def _is_overloaded(exc: Exception) -> bool:
+    low = _error_text(exc).lower()
+    return _status_code(exc) in (500, 503, 504) or "unavailable" in low or "overloaded" in low
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    low = _error_text(exc).lower()
+    return (
+        _status_code(exc) in (401, 403)
+        or "api key not valid" in low
+        or "api_key_invalid" in low
+        or "permission_denied" in low
+        or "unauthenticated" in low
+    )
+
+
+def _retry_delay(exc: Exception) -> Optional[float]:
+    """Seconds Google asks us to wait ('Please retry in 12.3s' / retryDelay: '12s')."""
+    text = _error_text(exc)
+    match = re.search(r"retry in ([\d.]+)\s*s", text, flags=re.IGNORECASE) or re.search(
+        r"retryDelay['\"]?\s*:\s*['\"]?([\d.]+)s", text
+    )
+    return float(match.group(1)) if match else None
 
 
 def _version_key(model_name: str) -> tuple:
@@ -201,10 +250,10 @@ def _version_key(model_name: str) -> tuple:
     return (int(match.group(1)), int(match.group(2) or 0))
 
 
-def discover_flash_model(client, exclude: str = "") -> Optional[str]:
-    """Return the newest stable Gemini Flash model this API key can use, or None."""
+def list_flash_models(client, exclude=()) -> List[str]:
+    """Usable stable Gemini Flash models, newest first (full Flash before Flash-Lite)."""
     try:
-        candidates = []
+        names = set()
         for m in client.models.list():
             name = (getattr(m, "name", "") or "").replace("models/", "")
             actions = getattr(m, "supported_actions", None)
@@ -214,11 +263,11 @@ def discover_flash_model(client, exclude: str = "") -> Optional[str]:
                 continue
             if actions is not None and "generateContent" not in actions:
                 continue
-            if name != exclude:
-                candidates.append(name)
-        return max(candidates, key=_version_key) if candidates else None
+            names.add(name)
+        names -= set(exclude)
+        return sorted(names, key=lambda n: (_version_key(n), "lite" not in n), reverse=True)
     except Exception:  # noqa: BLE001 - discovery is best-effort
-        return None
+        return []
 
 
 def _generate(client, model: str, prompt: str, use_schema: bool) -> ResumeAnalysis:
@@ -247,11 +296,38 @@ def _generate_with_schema_fallback(client, model: str, prompt: str) -> ResumeAna
     try:
         return _generate(client, model, prompt, use_schema=True)
     except Exception as exc:  # noqa: BLE001
-        if _is_model_not_found(exc) or isinstance(exc, ValueError):
+        # Only a schema-related 400 is worth retrying without the schema. Everything else
+        # (quota, overload, bad key, missing model, bad output) must NOT trigger a second
+        # request, because that wastes quota.
+        if (
+            isinstance(exc, ValueError)
+            or _is_model_not_found(exc)
+            or _is_rate_limited(exc)
+            or _is_overloaded(exc)
+            or _is_auth_error(exc)
+            or _status_code(exc) != 400
+        ):
             raise
-        # Some models reject a response schema; the prompt already spells out the JSON
-        # keys, so retry once with JSON mode only. A real error (bad key, quota) re-raises.
         return _generate(client, model, prompt, use_schema=False)
+
+
+def _call_with_retries(client, model: str, prompt: str, on_status=None) -> ResumeAnalysis:
+    """Call one model, waiting and retrying on short-lived rate limits / overload."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return _generate_with_schema_fallback(client, model, prompt)
+        except Exception as exc:  # noqa: BLE001
+            transient = (_is_rate_limited(exc) and not _is_hard_quota(exc)) or _is_overloaded(exc)
+            if not transient or attempt == MAX_RETRIES:
+                raise
+            delay = _retry_delay(exc)
+            if delay is not None and delay > MAX_WAIT_SECONDS:
+                raise  # too long to wait here; let the caller try another model
+            wait = (delay if delay is not None else 8 * (attempt + 1)) + 1
+            if on_status:
+                on_status(f"Gemini is busy ({model}). Retrying in {int(wait)}s...")
+            _sleep(wait)
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def analyze_resume(
@@ -259,33 +335,55 @@ def analyze_resume(
     resume_text: str,
     job_description: Optional[str],
     model: str = DEFAULT_MODEL,
+    on_status=None,
 ):
-    """Analyse a resume. Returns (analysis, model_actually_used)."""
+    """Analyse a resume. Returns (analysis, model_actually_used).
+
+    If a model is retired (404), out of quota (429) or overloaded (503), the next
+    available Gemini Flash model is tried automatically (up to MAX_MODELS_TRIED).
+    """
     prompt = build_prompt(resume_text, job_description)
-    try:
-        return _generate_with_schema_fallback(client, model, prompt), model
-    except Exception as exc:  # noqa: BLE001
-        if not _is_model_not_found(exc):
-            raise
-        alternative = discover_flash_model(client, exclude=model)
-        if not alternative:
-            raise ValueError(
-                f"Model '{model}' is not available for your API key, and no other Gemini Flash "
-                "model could be found. Enter a valid model name in the sidebar."
-            ) from exc
-        return _generate_with_schema_fallback(client, alternative, prompt), alternative
+    queue = [model]
+    tried: List[str] = []
+    discovered = False
+    last_exc: Optional[Exception] = None
+
+    while queue and len(tried) < MAX_MODELS_TRIED:
+        current = queue.pop(0)
+        tried.append(current)
+        try:
+            return _call_with_retries(client, current, prompt, on_status), current
+        except Exception as exc:  # noqa: BLE001
+            if not (_is_model_not_found(exc) or _is_rate_limited(exc) or _is_overloaded(exc)):
+                raise
+            last_exc = exc
+            if not discovered:
+                discovered = True
+                queue += [m for m in list_flash_models(client, exclude=tried) if m not in queue]
+            if on_status and queue:
+                on_status(f"{current} is unavailable right now. Trying {queue[0]}...")
+
+    assert last_exc is not None
+    if _is_model_not_found(last_exc) and not _is_rate_limited(last_exc):
+        raise ValueError(
+            f"Model '{model}' is not available for your API key, and no other Gemini Flash "
+            "model could be found. Enter a valid model name in the sidebar."
+        ) from last_exc
+    raise last_exc
 
 
 def friendly_error(exc: Exception) -> str:
-    text = str(exc)
-    low = text.lower()
-    if "api key" in low or "api_key" in low or "permission_denied" in low:
+    if _is_auth_error(exc):
         return "Your Gemini API key looks invalid or lacks access. Check the key and try again."
-    if "429" in text or "resource_exhausted" in low or "quota" in low:
-        return "Gemini rate limit or quota reached. Wait a minute and try again."
-    if "503" in text or "unavailable" in low or "overloaded" in low:
+    if _is_rate_limited(exc):
+        return (
+            "Gemini's rate/quota limit was reached on every model tried. Wait about a minute and "
+            "try again. If it keeps failing, your free daily quota may be used up: try again "
+            "tomorrow, use a different API key, or enable billing in Google AI Studio."
+        )
+    if _is_overloaded(exc):
         return "Gemini is temporarily overloaded. Please try again in a moment."
-    return text
+    return str(exc)
 
 
 def get_secret(name: str) -> Optional[str]:
@@ -435,13 +533,19 @@ def main() -> None:
             from google import genai
 
             client = genai.Client(api_key=api_key)
+            status = st.empty()
             with st.spinner("Analyzing your resume with Gemini..."):
-                analysis, used_model = analyze_resume(client, resume_text, job_description, model)
+                analysis, used_model = analyze_resume(
+                    client, resume_text, job_description, model, on_status=status.info
+                )
+            status.empty()
             st.session_state["analysis"] = analysis
             st.session_state["model_used"] = used_model
         except Exception as exc:  # noqa: BLE001
             st.session_state.pop("analysis", None)
             st.error(f"Analysis failed: {friendly_error(exc)}")
+            with st.expander("Technical details"):
+                st.code(str(exc)[:1500])
             st.stop()
 
     if "analysis" in st.session_state:
