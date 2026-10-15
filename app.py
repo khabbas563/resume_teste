@@ -22,7 +22,9 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gemini-2.5-flash"  # override with GEMINI_MODEL env var / secret
+DEFAULT_MODEL = "gemini-3.8-flash"  # override with GEMINI_MODEL env var / secret
+# If the chosen model is retired (404), the app auto-discovers the newest available Flash model.
+EXCLUDED_MODEL_WORDS = ("lite", "image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics")
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000  # keeps the prompt comfortably inside the context window
 MIN_RESUME_CHARS = 150  # below this we assume extraction failed (e.g. scanned PDF)
@@ -130,7 +132,12 @@ def build_prompt(resume_text: str, job_description: Optional[str]) -> str:
             "inferring the target role from the resume, and list commonly expected "
             "keywords for that role that are missing."
         )
-    return f"""Analyse the resume below and return a JSON object.
+    return f"""Analyse the resume below and return ONLY a JSON object (no markdown) with exactly these keys:
+overall_score (int), summary (string), category_scores (object with int keys: formatting,
+keywords, experience, skills, education, readability), strengths (string list),
+weaknesses (string list), missing_keywords (string list), improvements (string list),
+bullet_rewrites (list of objects with string keys "original" and "improved"),
+formatting_issues (string list).
 
 Scoring rules:
 - All scores are integers from 0 to 100.
@@ -180,28 +187,105 @@ def parse_analysis(raw: str) -> ResumeAnalysis:
     return analysis
 
 
-def analyze_resume(
-    client,
-    resume_text: str,
-    job_description: Optional[str],
-    model: str = DEFAULT_MODEL,
-) -> ResumeAnalysis:
+def _is_model_not_found(exc: Exception) -> bool:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    text = str(exc)
+    return code == 404 or "NOT_FOUND" in text or "no longer available" in text
+
+
+def _version_key(model_name: str) -> tuple:
+    """'models/gemini-3.8-flash' -> (3, 8) so newer models sort higher."""
+    match = re.search(r"gemini-(\d+)(?:\.(\d+))?", model_name)
+    if not match:
+        return (0, 0)
+    return (int(match.group(1)), int(match.group(2) or 0))
+
+
+def discover_flash_model(client, exclude: str = "") -> Optional[str]:
+    """Return the newest stable Gemini Flash model this API key can use, or None."""
+    try:
+        candidates = []
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None)
+            if not name.startswith("gemini-") or "flash" not in name:
+                continue
+            if any(word in name for word in EXCLUDED_MODEL_WORDS) or "preview" in name:
+                continue
+            if actions is not None and "generateContent" not in actions:
+                continue
+            if name != exclude:
+                candidates.append(name)
+        return max(candidates, key=_version_key) if candidates else None
+    except Exception:  # noqa: BLE001 - discovery is best-effort
+        return None
+
+
+def _generate(client, model: str, prompt: str, use_schema: bool) -> ResumeAnalysis:
     from google.genai import types  # imported lazily so the UI loads even if SDK is missing
 
+    # Note: temperature is intentionally left at the model default. Google recommends
+    # not lowering it for Gemini 3.x models (it can cause looping / worse output).
+    config_kwargs = {
+        "system_instruction": SYSTEM_INSTRUCTION,
+        "response_mime_type": "application/json",
+    }
+    if use_schema:
+        config_kwargs["response_schema"] = ResumeAnalysis
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2,
-            response_mime_type="application/json",
-            response_schema=ResumeAnalysis,
-        ),
+        contents=prompt,
+        config=types.GenerateContentConfig(**config_kwargs),
     )
     raw = getattr(response, "text", None)
     if not raw:
         raise ValueError("The AI returned an empty response (it may have been blocked). Try again.")
     return parse_analysis(raw)
+
+
+def _generate_with_schema_fallback(client, model: str, prompt: str) -> ResumeAnalysis:
+    try:
+        return _generate(client, model, prompt, use_schema=True)
+    except Exception as exc:  # noqa: BLE001
+        if _is_model_not_found(exc) or isinstance(exc, ValueError):
+            raise
+        # Some models reject a response schema; the prompt already spells out the JSON
+        # keys, so retry once with JSON mode only. A real error (bad key, quota) re-raises.
+        return _generate(client, model, prompt, use_schema=False)
+
+
+def analyze_resume(
+    client,
+    resume_text: str,
+    job_description: Optional[str],
+    model: str = DEFAULT_MODEL,
+):
+    """Analyse a resume. Returns (analysis, model_actually_used)."""
+    prompt = build_prompt(resume_text, job_description)
+    try:
+        return _generate_with_schema_fallback(client, model, prompt), model
+    except Exception as exc:  # noqa: BLE001
+        if not _is_model_not_found(exc):
+            raise
+        alternative = discover_flash_model(client, exclude=model)
+        if not alternative:
+            raise ValueError(
+                f"Model '{model}' is not available for your API key, and no other Gemini Flash "
+                "model could be found. Enter a valid model name in the sidebar."
+            ) from exc
+        return _generate_with_schema_fallback(client, alternative, prompt), alternative
+
+
+def friendly_error(exc: Exception) -> str:
+    text = str(exc)
+    low = text.lower()
+    if "api key" in low or "api_key" in low or "permission_denied" in low:
+        return "Your Gemini API key looks invalid or lacks access. Check the key and try again."
+    if "429" in text or "resource_exhausted" in low or "quota" in low:
+        return "Gemini rate limit or quota reached. Wait a minute and try again."
+    if "503" in text or "unavailable" in low or "overloaded" in low:
+        return "Gemini is temporarily overloaded. Please try again in a moment."
+    return text
 
 
 def get_secret(name: str) -> Optional[str]:
@@ -352,14 +436,17 @@ def main() -> None:
 
             client = genai.Client(api_key=api_key)
             with st.spinner("Analyzing your resume with Gemini..."):
-                st.session_state["analysis"] = analyze_resume(client, resume_text, job_description, model)
+                analysis, used_model = analyze_resume(client, resume_text, job_description, model)
+            st.session_state["analysis"] = analysis
+            st.session_state["model_used"] = used_model
         except Exception as exc:  # noqa: BLE001
             st.session_state.pop("analysis", None)
-            st.error(f"Analysis failed: {exc}")
+            st.error(f"Analysis failed: {friendly_error(exc)}")
             st.stop()
 
     if "analysis" in st.session_state:
         render_results(st.session_state["analysis"])
+        st.caption(f"Analysed with {st.session_state.get('model_used', model)}")
 
 
 if __name__ == "__main__":
