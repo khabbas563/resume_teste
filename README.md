@@ -55,7 +55,7 @@ streamlit run app.py
 | Name | Where | Default | Purpose |
 |------|-------|---------|---------|
 | `GEMINI_API_KEY` | env var or Streamlit secret | none | Your Gemini API key |
-| `GEMINI_MODEL` | env var or Streamlit secret | `gemini-2.5-flash` | Gemini model id. Change it if Google retires/renames the model |
+| `GEMINI_MODEL` | env var or Streamlit secret | `gemini-3.8-flash` | Gemini model id. If it is retired (404), the app automatically switches to the newest stable Gemini Flash model your key can use and shows which one it used |
 
 ## Push to GitHub
 
@@ -99,3 +99,9 @@ Updating the app later is just `git push`; Streamlit redeploys automatically.
 - The "ATS score" is an AI estimate, not the output of a specific real ATS. Use it as guidance.
 - The resume text is sent to Google's Gemini API. Do not use this with data you are not allowed to share.
 - Free-tier API keys have rate limits; if you see a quota error, wait a minute and retry.
+
+## Troubleshooting
+
+- **`404 NOT_FOUND ... model is no longer available`**: Google retired that model name. This version handles it automatically; if you set `GEMINI_MODEL` or the sidebar field to an old name, clear it or enter a current Flash model name.
+- **API key invalid**: create a new key at https://aistudio.google.com/apikey and make sure there are no spaces or quotes around it in the secrets file.
+- **Old library error**: run `pip install -U google-genai`.
