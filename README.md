@@ -103,5 +103,6 @@ Updating the app later is just `git push`; Streamlit redeploys automatically.
 ## Troubleshooting
 
 - **`404 NOT_FOUND ... model is no longer available`**: Google retired that model name. This version handles it automatically; if you set `GEMINI_MODEL` or the sidebar field to an old name, clear it or enter a current Flash model name.
+- **Rate limit / quota reached (429)**: the app waits and retries automatically for short per-minute limits, and switches to another Gemini Flash model if one is out of quota. If every model is exhausted, you have hit the free-tier limits for your key. Wait a minute (per-minute limit) or until tomorrow (daily limit), use another API key, or enable billing in [Google AI Studio](https://aistudio.google.com). Avoid clicking Analyze repeatedly, since each click uses quota.
 - **API key invalid**: create a new key at https://aistudio.google.com/apikey and make sure there are no spaces or quotes around it in the secrets file.
 - **Old library error**: run `pip install -U google-genai`.
